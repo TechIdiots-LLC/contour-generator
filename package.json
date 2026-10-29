@@ -1,6 +1,6 @@
 {
   "name": "contour-generator",
-  "version": "2.0.8",
+  "version": "2.1.0",
   "description": "Locally generates contour vector tiles using maplibre-contour",
   "main": "./dist/index.js",
   "bin": {
