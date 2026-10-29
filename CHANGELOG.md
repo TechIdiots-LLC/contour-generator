@@ -6,6 +6,7 @@
 - Progress is shown without `--verbose`: a `[progress]` line per pyramid every ten seconds, a `[slow]` line naming any tile that takes more than 30 seconds, and a `[failed]` line for any tile that fails.
 - A failed tile or pyramid no longer stops the run. The failures are listed at the end and the command exits with an error; run it again to retry them.
 - Add `--demTimeout` (seconds, default 120).
+- Tiles are processed in Z-order instead of row by row, so the DEM tiles a contour tile shares with its neighbours are still cached when they are wanted again. Each DEM tile is decoded about once instead of about three times, with identical output.
 - _...Add new stuff here..._
 
 ### 🐞 Bug fixes

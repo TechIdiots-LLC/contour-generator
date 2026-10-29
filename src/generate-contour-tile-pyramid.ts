@@ -30,6 +30,7 @@ import {
 
 import { getChildren } from "@mapbox/tilebelt";
 import path from "path";
+import { sortTilesForCache } from "./tile-order.js";
 import type { Encoding } from "../node_modules/maplibre-contour/dist/types.d.ts";
 import { type PMTiles } from "pmtiles";
 
@@ -556,12 +557,9 @@ async function processQueue(queue: Tile[]): Promise<Failure[]> {
 
 const children: Tile[] = getAllTiles([numX, numY, numZ], numoutputMaxZoom);
 
-// Sort children for more predictable processing order (optional but good practice)
-children.sort((a, b) => {
-  if (a[2] !== b[2]) return a[2] - b[2]; // Sort by zoom level
-  if (a[0] !== b[0]) return a[0] - b[0]; // Sort by X
-  return a[1] - b[1]; // Sort by Y
-});
+// Zoom by zoom, and in Z-order within a zoom so the DEM tiles neighbouring tiles
+// share are still cached when they are wanted again. See src/tile-order.ts.
+sortTilesForCache(children);
 
 // Ensure the base output directory exists
 if (!existsSync(outputDir)) {
