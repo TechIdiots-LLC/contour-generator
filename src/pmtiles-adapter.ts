@@ -115,10 +115,10 @@ export async function getPMtilesTile(
       return { data: undefined, mimeType: mimeType };
     }
   } catch (error: any) {
-    console.error(
-      `Error fetching PMTiles tile (z:${z}, x:${x}, y:${y}):`,
-      error.message,
+    // A read that failed is not a tile that is missing. Reporting it as one
+    // would leave a hole in the output that looks like a gap in the DEM.
+    throw new Error(
+      `Error fetching PMTiles tile (z:${z}, x:${x}, y:${y}): ${error.message}`,
     );
-    return { data: undefined, mimeType: undefined };
   }
 }

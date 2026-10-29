@@ -6,6 +6,11 @@ import path from "path";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import { fileURLToPath } from "url";
 import { bboxToTiles } from "./bbox_to_tiles.js";
+import {
+  collectMaskValue,
+  collectMaskRange,
+  type MaskRange,
+} from "./mask-options.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,9 +25,12 @@ type BaseOptions = {
   outputDir: string;
   processes: number;
   verbose: boolean;
-  blankTileNoDataValue: number;
-  blankTileSize: number;
-  blankTileFormat: string;
+  maskValue: number[];
+  maskRange: MaskRange[];
+  // Deprecated and ignored
+  blankTileNoDataValue?: number;
+  blankTileSize?: number;
+  blankTileFormat?: string;
 };
 
 type PyramidOptions = BaseOptions & {
@@ -141,13 +149,15 @@ async function processTile(options: PyramidOptions): Promise<void> {
       options.outputMaxZoom.toString(),
       "--outputDir",
       options.outputDir,
-      "--blankTileNoDataValue",
-      options.blankTileNoDataValue.toString(),
-      "--blankTileSize",
-      options.blankTileSize.toString(),
-      "--blankTileFormat",
-      options.blankTileFormat,
     ];
+
+    // Passed as --flag=value so a negative height is not read as another option
+    for (const value of options.maskValue) {
+      commandArgs.push(`--maskValue=${value}`);
+    }
+    for (const [low, high] of options.maskRange) {
+      commandArgs.push(`--maskRange=${low},${high}`);
+    }
 
     // Pass the verbose flag down to the child process ONLY if the orchestrator is verbose
     if (options.verbose) {
@@ -314,7 +324,7 @@ async function processTilesInParallel(
 
 // --- Command Handlers ---
 
-async function runPyramid(options: Required<PyramidOptions>): Promise<void> {
+async function runPyramid(options: PyramidOptions): Promise<void> {
   await processTile(options);
   await createMetadata(options.outputDir, options.z, options.outputMaxZoom);
 }
@@ -413,10 +423,32 @@ async function main(): Promise<void> {
     defaultValue: number;
   };
 
+  type NumberListOptionConfig = {
+    type: "numberList";
+    flags: string;
+    description: string;
+    collect: (value: string, previous: number[]) => number[];
+  };
+
+  type RangeListOptionConfig = {
+    type: "rangeList";
+    flags: string;
+    description: string;
+    collect: (value: string, previous: MaskRange[]) => MaskRange[];
+  };
+
+  type DeprecatedOptionConfig = {
+    type: "deprecated";
+    flags: string;
+  };
+
   type OptionConfig =
     | RequiredOptionConfig
     | StandardOptionConfig
-    | ParsedOptionConfig;
+    | ParsedOptionConfig
+    | NumberListOptionConfig
+    | RangeListOptionConfig
+    | DeprecatedOptionConfig;
 
   const commonOptionConfigs: OptionConfig[] = [
     // required options
@@ -438,13 +470,6 @@ async function main(): Promise<void> {
       flags: "--outputDir <string>",
       description: "The output directory where tiles will be stored.",
       defaultValue: "./output",
-    },
-    {
-      type: "standard",
-      flags: "--blankTileFormat <string>",
-      description:
-        "The image format for generated blank tiles ('png', 'webp', or 'jpeg').",
-      defaultValue: "png",
     },
     {
       type: "standard",
@@ -481,21 +506,25 @@ async function main(): Promise<void> {
       parser: Number,
       defaultValue: 8,
     },
+    // no-data masks
     {
-      type: "parsed",
-      flags: "--blankTileNoDataValue <number>",
+      type: "numberList",
+      flags: "--maskValue <number>",
       description:
-        "The elevation value to use for blank tiles when a DEM tile is missing.",
-      parser: Number,
-      defaultValue: 0,
+        "A height (metres) that means no data. Repeat for several. A mapbox-encoded pixel of exactly -10000 m is always masked.",
+      collect: collectMaskValue,
     },
     {
-      type: "parsed",
-      flags: "--blankTileSize <number>",
-      description: "The pixel dimension of the tiles (e.g., 256 or 512).",
-      parser: Number,
-      defaultValue: 512,
+      type: "rangeList",
+      flags: "--maskRange <low,high>",
+      description:
+        "A band of heights (metres) that means no data, like -10001,-9999. Repeat for several.",
+      collect: collectMaskRange,
     },
+    // A missing DEM tile is now no data rather than a flat blank tile
+    { type: "deprecated", flags: "--blankTileNoDataValue <number>" },
+    { type: "deprecated", flags: "--blankTileSize <number>" },
+    { type: "deprecated", flags: "--blankTileFormat <string>" },
   ];
 
   // --- Pyramid Command ---
@@ -569,6 +598,22 @@ async function main(): Promise<void> {
     for (const config of configs) {
       if (config.type === "required") {
         command.requiredOption(config.flags, config.description);
+      } else if (config.type === "numberList") {
+        command.option(
+          config.flags,
+          config.description,
+          config.collect,
+          [] as number[],
+        );
+      } else if (config.type === "rangeList") {
+        command.option(
+          config.flags,
+          config.description,
+          config.collect,
+          [] as MaskRange[],
+        );
+      } else if (config.type === "deprecated") {
+        command.option(config.flags, "Deprecated and ignored.");
       } else if (config.type === "parsed") {
         // This is a ParsedOptionConfig - needs parser
         command.option(
@@ -589,16 +634,31 @@ async function main(): Promise<void> {
   applyCommonOptions(zoomCmd, commonOptionConfigs);
   applyCommonOptions(bboxCmd, commonOptionConfigs);
 
+  const warnDeprecated = (options: BaseOptions) => {
+    if (
+      options.blankTileNoDataValue !== undefined ||
+      options.blankTileSize !== undefined ||
+      options.blankTileFormat !== undefined
+    ) {
+      console.warn(
+        "--blankTileNoDataValue, --blankTileSize and --blankTileFormat are ignored: a missing DEM tile is now treated as no data, and no contours are drawn there.",
+      );
+    }
+  };
+
   // --- Set up action handlers (after options are defined) ---
   pyramidCmd.action(async (options: PyramidOptions) => {
+    warnDeprecated(options);
     await runPyramid(options);
   });
 
   zoomCmd.action(async (options: ZoomOptions) => {
+    warnDeprecated(options);
     await runZoom(options);
   });
 
   bboxCmd.action(async (options: BboxOptions) => {
+    warnDeprecated(options);
     await runBbox(options);
   });
 

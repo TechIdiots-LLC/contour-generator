@@ -169,13 +169,26 @@ docker run --rm -v $(pwd):/data wifidb/contour-generator \
 - `--minx`, `--miny`, `--maxx`, `--maxy`: Bounding box coordinates (required)
 - `--outputMinZoom`: Starting zoom level (default: 5)
 
-### Advanced Options
+### Missing Tiles and No Data
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--blankTileNoDataValue` | `0` | Elevation for missing tiles |
-| `--blankTileSize` | `512` | Tile size in pixels |
-| `--blankTileFormat` | `png` | Format for generated blank tiles |
+Contours are only drawn where the DEM has ground. A DEM tile that does not exist is treated as no data, so no contour tile is written under it and lines stop where the data does. (Earlier versions filled missing tiles with a flat blank tile, which drew packed lines along the edge of the data.)
+
+Pixels inside a DEM tile can also mean "nothing here". They are treated as no data when they are:
+
+- fully transparent
+- a mapbox-encoded pixel of exactly -10000 m, which is what an all-black pixel decodes to
+- equal to a `--maskValue`, or inside a `--maskRange`
+
+Marking no-data pixels matters for speed as well as appearance: a few stray -10000 m pixels beside terrain make the tracer walk thousands of levels per cell. Resampling blurs sentinels, so a sea authored as exactly 0 often arrives as 0 with scattered -0.4 and 0.1 values. A band catches those where an exact value would not.
+
+| Parameter | Description |
+|-----------|-------------|
+| `--maskValue <metres>` | A height that means no data. Repeat for several. |
+| `--maskRange <low,high>` | A band of heights that means no data, like `--maskRange=-10001,-9999`. Repeat for several. |
+
+Write negative values as `--maskValue=-10000` so they are not read as another option.
+
+`--blankTileNoDataValue`, `--blankTileSize` and `--blankTileFormat` are deprecated and ignored.
 
 ## Using the Output
 

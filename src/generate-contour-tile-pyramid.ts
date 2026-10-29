@@ -5,10 +5,16 @@ import { writeFileSync, mkdir, existsSync } from "fs";
 import mlcontour from "maplibre-contour";
 import {
   extractZXYFromUrlTrim,
-  GetImageData,
+  createImageDecoder,
   getOptionsForZoom,
-  createBlankTileImage,
+  noDataBlob,
+  NO_DATA_MIME,
 } from "./mlcontour-adapter.js";
+import {
+  collectMaskValue,
+  collectMaskRange,
+  type MaskRange,
+} from "./mask-options.js";
 import {
   getPMtilesTile,
   openPMtiles,
@@ -69,23 +75,23 @@ program
     "--outputDir <string>",
     "The output directory where tiles will be stored.",
   )
-  // --- Blank Tile Options Group ---
+  // --- No-data masks ---
   .option(
-    "--blankTileNoDataValue <number>",
-    "The elevation value to use for blank tiles when a DEM tile is missing.",
-    "0", // Default no-data value, adjust as needed
+    "--maskValue <number>",
+    "A height (metres) that means no data. Repeat for several.",
+    collectMaskValue,
+    [] as number[],
   )
   .option(
-    "--blankTileSize <number>",
-    "The pixel dimension of the tiles (e.g., 256 or 512).",
-    "512", // Default tile size
+    "--maskRange <low,high>",
+    "A band of heights (metres) that means no data, like -10001,-9999. Repeat for several.",
+    collectMaskRange,
+    [] as MaskRange[],
   )
-  .option(
-    "--blankTileFormat <string>",
-    "The image format for generated blank tiles ('png', 'webp', or 'jpeg'). This is used as a fallback if the source format cannot be determined.",
-    "png", // Default format for blank tiles
-  )
-  // ADD THE VERBOSE OPTION HERE
+  // --- Deprecated: missing DEM tiles are now no data, not a flat blank tile ---
+  .option("--blankTileNoDataValue <number>", "Deprecated and ignored.")
+  .option("--blankTileSize <number>", "Deprecated and ignored.")
+  .option("--blankTileFormat <string>", "Deprecated and ignored.")
   .option("-v, --verbose", "Enable verbose output.")
   .parse(process.argv);
 
@@ -103,27 +109,32 @@ const {
   outputDir,
   blankTileSize,
   blankTileFormat,
+  maskValue,
+  maskRange,
   verbose, // Capture the verbose option
 } = options;
 
 const numX = Number(x);
 const numY = Number(y);
 const numZ = Number(z);
-const numblankTileNoDataValue = Number(blankTileNoDataValue);
 const numsourceMaxZoom = Number(sourceMaxZoom);
 const numIncrement = Number(increment);
 const numoutputMaxZoom = Number(outputMaxZoom);
-const numblankTileSize = Number(blankTileSize);
 
-const validBlankTileFormats = ["png", "webp", "jpeg"];
-if (!validBlankTileFormats.includes(blankTileFormat)) {
-  console.error(
-    `Invalid value for --blankTileFormat: ${blankTileFormat}. Must be one of: ${validBlankTileFormats.join(
-      ", ",
-    )}`,
+if (
+  blankTileNoDataValue !== undefined ||
+  blankTileSize !== undefined ||
+  blankTileFormat !== undefined
+) {
+  console.warn(
+    "--blankTileNoDataValue, --blankTileSize and --blankTileFormat are ignored: a missing DEM tile is now treated as no data, and no contours are drawn there.",
   );
-  process.exit(1);
 }
+
+const decodeImage = createImageDecoder({
+  values: maskValue,
+  ranges: maskRange,
+});
 
 // --------------------------------------------------
 // mlcontour options/defaults
@@ -198,6 +209,26 @@ interface TileFetcher {
   (url: string, abortController: AbortController): Promise<TileFetcherResult>;
 }
 
+// Source tiles known to be missing, as "z/x/y". A missing tile is no data
+// rather than an error; this is how processTile tells that the tile it is
+// drawing has no ground under it, in which case there is nothing to write.
+const missingDemTiles = new Set<string>();
+
+function missingTile(url: string, zxy: { z: number; x: number; y: number }) {
+  missingDemTiles.add(`${zxy.z}/${zxy.x}/${zxy.y}`);
+  if (verbose) {
+    console.log(
+      `[Fetcher] DEM tile not found for ${url} (z:${zxy.z}, x:${zxy.x}, y:${zxy.y}). Treating as no data.`,
+    );
+  }
+  return {
+    data: noDataBlob(),
+    mimeType: NO_DATA_MIME,
+    expires: undefined,
+    cacheControl: undefined,
+  };
+}
+
 const pmtilesFetcher: TileFetcher = async (
   url: string,
   _abortController: AbortController,
@@ -225,25 +256,7 @@ const pmtilesFetcher: TileFetcher = async (
   );
 
   if (!zxyTileData) {
-    console.warn(
-      `DEM tile not found for ${url} (z:${zxy.z}, x:${zxy.x}, y:${zxy.y}). Generating blank tile.`,
-    );
-    const sourceMimeType = pmtilesMimeType || `image/${blankTileFormat}`;
-    const formatForBlank = sourceMimeType.split("/")[1] || blankTileFormat;
-
-    const blankTileBuffer = await createBlankTileImage(
-      numblankTileSize,
-      numblankTileSize,
-      numblankTileNoDataValue,
-      encoding as Encoding,
-      formatForBlank as any,
-    );
-    return {
-      data: new Blob([blankTileBuffer], { type: sourceMimeType }),
-      mimeType: sourceMimeType,
-      expires: undefined,
-      cacheControl: undefined,
-    };
+    return missingTile(url, zxy);
   }
 
   const mimeType = pmtilesMimeType || "image/png";
@@ -274,74 +287,56 @@ const mbtilesFetcher: TileFetcher = async (
     );
   }
 
-  try {
-    const tileData = await getMBTilesTile(
-      mbtilesSource.handle,
-      zxy.z,
-      zxy.x,
-      zxy.y,
-    );
+  const tileData = await getMBTilesTile(
+    mbtilesSource.handle,
+    zxy.z,
+    zxy.x,
+    zxy.y,
+  );
 
-    if (!tileData || !tileData.data) {
-      console.warn(
-        `DEM tile not found for ${url} (z:${zxy.z}, x:${zxy.x}, y:${zxy.y}). Generating blank tile.`,
-      );
-      const sourceFormat = mbtilesSource.metadata?.format || blankTileFormat;
-
-      const blankTileBuffer = await createBlankTileImage(
-        numblankTileSize,
-        numblankTileSize,
-        numblankTileNoDataValue,
-        encoding as Encoding,
-        sourceFormat as any,
-      );
-      const blobType = `image/${sourceFormat}`;
-      return {
-        data: new Blob([blankTileBuffer], { type: blobType }),
-        mimeType: blobType,
-        expires: undefined,
-        cacheControl: undefined,
-      };
-    }
-
-    let blobType = "image/png"; // Default
-    if (tileData.contentType) {
-      blobType = tileData.contentType;
-    }
-    return {
-      data: new Blob([tileData.data], { type: blobType }),
-      mimeType: blobType,
-      expires: undefined,
-      cacheControl: undefined,
-    };
-  } catch (error: any) {
-    if (
-      error.message.includes("Tile does not exist") ||
-      error.message.includes("no such row")
-    ) {
-      console.warn(
-        `DEM tile not found for ${url} (z:${zxy.z}, x:${zxy.x}, y:${zxy.y}). Generating blank tile.`,
-      );
-      const sourceFormat = mbtilesSource.metadata?.format || blankTileFormat;
-
-      const blankTileBuffer = await createBlankTileImage(
-        numblankTileSize,
-        numblankTileSize,
-        numblankTileNoDataValue,
-        encoding as Encoding,
-        sourceFormat as any,
-      );
-      const blobType = `image/${sourceFormat}`;
-      return {
-        data: new Blob([blankTileBuffer], { type: blobType }),
-        mimeType: blobType,
-        expires: undefined,
-        cacheControl: undefined,
-      };
-    } else {
-      throw error;
-    }
+  if (!tileData || !tileData.data) {
+    return missingTile(url, zxy);
   }
+
+  const blobType = tileData.contentType || "image/png";
+  return {
+    data: new Blob([tileData.data], { type: blobType }),
+    mimeType: blobType,
+    expires: undefined,
+    cacheControl: undefined,
+  };
+};
+
+// Tile server URL pattern. A 404 is a tile the server does not have, which is
+// no data; anything else that is not a success is a real failure.
+const httpFetcher: TileFetcher = async (
+  url: string,
+  abortController: AbortController,
+) => {
+  const zxy = extractZXYFromUrlTrim(url);
+  if (!zxy) {
+    throw new Error(`Could not extract zxy from ${url}`);
+  }
+
+  if (verbose) {
+    console.log(`[Fetcher] Fetching: ${url}`);
+  }
+
+  const response = await fetch(url, { signal: abortController.signal });
+  if (response.status === 404) {
+    return missingTile(url, zxy);
+  }
+  if (!response.ok) {
+    throw new Error(`Bad response ${response.status} for ${url}`);
+  }
+
+  const blob = await response.blob();
+  return {
+    data: blob,
+    mimeType: blob.type || undefined,
+    expires: undefined,
+    cacheControl: undefined,
+  };
 };
 
 // --------------------------------------------------
@@ -378,7 +373,7 @@ async function initializeSources() {
       console.log(`[Init] Using URL pattern: ${demUrl}`);
     }
     demUrlPattern = demUrl;
-    currentFetcher = undefined; // For direct URL fetching if not PMTiles/MBTiles
+    currentFetcher = httpFetcher; // Direct tile server URL pattern
   }
 }
 
@@ -390,7 +385,7 @@ const demManagerOptions = {
   encoding: encoding as Encoding,
   maxzoom: numsourceMaxZoom,
   timeoutMs: 10000,
-  decodeImage: GetImageData,
+  decodeImage,
   demUrlPattern: demUrlPattern, // Pass the determined pattern
   getTile: currentFetcher, // Pass the appropriate fetcher function
 };
@@ -439,6 +434,24 @@ async function processTile(v: Tile): Promise<void> {
       new AbortController(), // AbortController can be used for timeout/cancellation
     );
     const tileBuffer = Buffer.from(tile.arrayBuffer);
+
+    // Nothing to draw where the DEM has no tile: the lines stop where the
+    // ground does, so no file is written. The DEM tile this one is drawn from
+    // is the source tile at or above the source's maximum zoom.
+    const demZ = Math.min(z, numsourceMaxZoom);
+    const demDiv = 2 ** (z - demZ);
+    if (
+      missingDemTiles.has(
+        `${demZ}/${Math.floor(x / demDiv)}/${Math.floor(y / demDiv)}`,
+      )
+    ) {
+      if (verbose) {
+        console.log(
+          `[Tile ${z}-${x}-${y}] No DEM data under this tile. Not writing.`,
+        );
+      }
+      return;
+    }
 
     // Ensure directory exists before writing
     await new Promise<void>((resolve, reject) => {
