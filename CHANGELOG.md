@@ -1,5 +1,12 @@
 ## main
 ### ✨ Features and improvements
+- _...Add new stuff here..._
+
+### 🐞 Bug fixes
+- _...Add new stuff here..._
+
+## 2.1.0
+### ✨ Features and improvements
 - A missing DEM tile is now no data instead of a flat blank tile. Contours stop where the ground does and no tile is written under a missing DEM tile. `--blankTileNoDataValue`, `--blankTileSize` and `--blankTileFormat` are deprecated and ignored.
 - Add `--maskValue` and `--maskRange` to mark heights that mean no data. A mapbox-encoded pixel of exactly -10000 m and fully transparent pixels are always masked.
 - A tile server URL pattern now treats a 404 as a missing tile instead of an error.
@@ -7,7 +14,6 @@
 - A failed tile or pyramid no longer stops the run. The failures are listed at the end and the command exits with an error; run it again to retry them.
 - Add `--demTimeout` (seconds, default 120).
 - Tiles are processed in Z-order instead of row by row, so the DEM tiles a contour tile shares with its neighbours are still cached when they are wanted again. Each DEM tile is decoded about once instead of about three times, with identical output.
-- _...Add new stuff here..._
 
 ### 🐞 Bug fixes
 - Stray no-data pixels such as mapbox's -10000 m no longer make a tile take minutes and produce an enormous vector tile.
@@ -17,7 +23,6 @@
 - Tiles with nothing to draw are no longer written as empty files.
 - Errors in a batch were logged and dropped, and the worker still reported success. They are now reported and exit with an error.
 - Workers are started without a shell, so an output directory or DEM path containing a space works.
-- _...Add new stuff here..._
 
 ## 2.0.8
 ### ✨ Features and improvements
