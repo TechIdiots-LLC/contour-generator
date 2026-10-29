@@ -155,6 +155,7 @@ docker run --rm -v $(pwd):/data wifidb/contour-generator \
 | `--outputMaxZoom` | `8` | Maximum zoom of output tiles |
 | `--outputDir` | `./output` | Directory for generated tiles |
 | `--processes` | `8` | Parallel processes (adjust for your CPU) |
+| `--demTimeout` | `120` | Seconds to wait for a DEM tile before giving up on it |
 | `--verbose` | `false` | Enable detailed logging |
 
 ### Function-specific Parameters
@@ -168,6 +169,12 @@ docker run --rm -v $(pwd):/data wifidb/contour-generator \
 **bbox function:**
 - `--minx`, `--miny`, `--maxx`, `--maxy`: Bounding box coordinates (required)
 - `--outputMinZoom`: Starting zoom level (default: 5)
+
+### Progress and Failures
+
+Without `--verbose` you still see a `[progress]` line from each pyramid every ten seconds, a `[slow]` line for any tile that takes more than 30 seconds (with its coordinates), and a `[failed]` line for any tile that could not be generated. A slow tile is usually one with no-data pixels in its DEM, see below.
+
+A failed tile does not stop the run. Everything else carries on, the failures are listed at the end, and the command exits with an error. Run the same command again to retry them: tiles that were already written are skipped.
 
 ### Missing Tiles and No Data
 

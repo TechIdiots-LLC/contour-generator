@@ -25,6 +25,7 @@ type BaseOptions = {
   outputDir: string;
   processes: number;
   verbose: boolean;
+  demTimeout: number;
   maskValue: number[];
   maskRange: MaskRange[];
   // Deprecated and ignored
@@ -149,6 +150,8 @@ async function processTile(options: PyramidOptions): Promise<void> {
       options.outputMaxZoom.toString(),
       "--outputDir",
       options.outputDir,
+      "--demTimeout",
+      options.demTimeout.toString(),
     ];
 
     // Passed as --flag=value so a negative height is not read as another option
@@ -164,51 +167,63 @@ async function processTile(options: PyramidOptions): Promise<void> {
       commandArgs.push("--verbose"); // Pass the verbose flag to the child
     }
 
-    const workerProcess = spawn("node", commandArgs, {
+    // Run with this same node, and without a shell: through one, a path with a
+    // space in it is split into separate arguments.
+    const workerProcess = spawn(process.execPath, commandArgs, {
       stdio: ["ignore", "pipe", "pipe"], // Capture stdout and stderr
-      shell: true, // Use false for better security and performance
+      shell: false,
+      windowsHide: true,
     });
 
     const processPrefix = `[Tile ${options.z}-${options.x}-${options.y}] `;
 
-    // Buffering for verbose output to prevent flooding the console and consuming excessive memory
+    // The worker tags the lines worth seeing on a long run: progress, tiles
+    // that took a long time, and failures. Everything else is only shown with
+    // --verbose, since a pyramid can hold hundreds of thousands of tiles.
+    const worthShowing = /^\[(progress|slow|failed)\]/;
     let stdoutBuffer = "";
     let stderrBuffer = "";
+    let stderrTail = ""; // what the exit error quotes
+
+    const forward = (
+      buffer: string,
+      chunk: string,
+      write: (line: string) => void,
+    ): string => {
+      const lines = (buffer + chunk).split("\n");
+      const partial = lines.pop() || ""; // the last line may be incomplete
+      for (const line of lines) {
+        const text = line.trim();
+        if (text && (options.verbose || worthShowing.test(text))) {
+          write(processPrefix + text);
+        }
+      }
+      return partial;
+    };
 
     workerProcess.stdout.on("data", (data) => {
-      stdoutBuffer += data.toString();
-      // Process captured output if orchestrator is verbose.
-      // We trust the child process to handle its own verbose output; this capture
-      // is mainly for potential error logging or if the child isn't verbose.
-      if (options.verbose) {
-        const lines = stdoutBuffer.split("\n");
-        stdoutBuffer = lines.pop() || ""; // Keep the last (potentially partial) line
-        // Log with orchestrator's prefix, but only if it's not already verbose output from child
-        // This is still tricky. The robust solution is to NOT log here and let the child's verbose logs appear.
-        // However, for debugging purposes, logging captured data is useful.
-        // The duplicate "Starting..." and "Finished..." are from the orchestrator's own handlers.
-        // We should avoid double-logging the CHILD's output.
-        //
-        // For now, let's keep the logging here, but be aware it might duplicate child's --verbose output.
-        // The FIX for the "Starting..." and "Finished..." duplication is in the orchestrator handlers themselves.
-        lines.forEach((line) => console.log(processPrefix + line.trim()));
-      }
+      stdoutBuffer = forward(stdoutBuffer, data.toString(), console.log);
     });
 
     workerProcess.stderr.on("data", (data) => {
-      stderrBuffer += data.toString();
-      if (options.verbose) {
-        const lines = stderrBuffer.split("\n");
-        stderrBuffer = lines.pop() || "";
-        lines.forEach((line) => console.error(processPrefix + line.trim()));
-      }
+      const chunk = data.toString();
+      stderrTail = (stderrTail + chunk).slice(-2000);
+      stderrBuffer = forward(stderrBuffer, chunk, console.error);
     });
 
     workerProcess.on("close", (code) => {
-      // Flush any remaining buffered data if verbose, primarily for error reporting
-      if (options.verbose) {
-        if (stdoutBuffer) console.log(processPrefix + stdoutBuffer.trim());
-        if (stderrBuffer) console.error(processPrefix + stderrBuffer.trim());
+      // Whatever was left without a newline
+      if (
+        stdoutBuffer &&
+        (options.verbose || worthShowing.test(stdoutBuffer.trim()))
+      ) {
+        console.log(processPrefix + stdoutBuffer.trim());
+      }
+      if (
+        stderrBuffer &&
+        (options.verbose || worthShowing.test(stderrBuffer.trim()))
+      ) {
+        console.error(processPrefix + stderrBuffer.trim());
       }
 
       if (code === 0) {
@@ -220,7 +235,7 @@ async function processTile(options: PyramidOptions): Promise<void> {
         // Reject with a more informative error, including stderr content
         reject(
           new Error(
-            `${processPrefix}Exited with code ${code}. Captured stderr: "${stderrBuffer.trim()}"`,
+            `${processPrefix}Exited with code ${code}. Last stderr: "${stderrTail.trim()}"`,
           ),
         );
       }
@@ -252,74 +267,61 @@ async function processTilesInParallel(
     return;
   }
 
-  let currentIndex = 0;
-  let completedCount = 0;
-  const activeWorkers: Promise<void>[] = [];
-
   console.log(
     `[Main] Starting to process ${totalTiles} tiles with up to ${maxProcesses} parallel processes.`,
   );
 
-  return new Promise((resolve, reject) => {
-    const scheduleNextTile = () => {
-      // If all tasks are assigned and all active workers have finished, we are done.
-      if (currentIndex >= totalTiles && activeWorkers.length === 0) {
-        console.log(`[Main] All ${totalTiles} tiles processed.`);
-        return resolve();
+  let currentIndex = 0;
+  let completedCount = 0;
+  const failed: string[] = [];
+
+  // A failed pyramid is recorded and the rest carry on, so one bad pyramid
+  // does not stop a run that has been going for hours. They are reported
+  // together at the end.
+  const run = async () => {
+    while (currentIndex < totalTiles) {
+      const [z, x, y] = coordinates[currentIndex];
+      currentIndex++;
+
+      if (options.verbose) {
+        console.log(
+          `[Main] Assigning tile ${z}-${x}-${y} to worker. (${currentIndex}/${totalTiles} assigned)`,
+        );
       }
 
-      // While we have tasks left and the number of active workers is below the limit
-      while (currentIndex < totalTiles && activeWorkers.length < maxProcesses) {
-        const [z, x, y] = coordinates[currentIndex];
-        const tileOptions: PyramidOptions = {
-          ...options,
-          z,
-          x,
-          y,
-        };
-
-        currentIndex++;
-
-        if (options.verbose) {
-          console.log(
-            `[Main] Assigning tile ${z}-${x}-${y} to worker. (${currentIndex}/${totalTiles} assigned)`,
-          );
-        }
-
-        // Create a promise for this tile's processing
-        const tilePromise = processTile(tileOptions)
-          .then(() => {
-            completedCount++;
-            if (options.verbose) {
-              console.log(
-                `[Main] Tile ${z}-${x}-${y} completed. (${completedCount}/${totalTiles} done)`,
-              );
-            }
-          })
-          .catch((error) => {
-            console.error(
-              `[Main] Error processing tile ${z}-${x}-${y}:`,
-              error,
-            );
-            reject(error); // Reject the main promise if any tile fails
-          })
-          .finally(() => {
-            // Remove this worker from the active pool
-            const index = activeWorkers.indexOf(tilePromise);
-            if (index > -1) {
-              activeWorkers.splice(index, 1);
-            }
-            // Try to schedule the next available tile
-            scheduleNextTile();
-          });
-
-        activeWorkers.push(tilePromise);
+      try {
+        await processTile({ ...options, z, x, y });
+      } catch (error: any) {
+        failed.push(`${z}/${x}/${y}`);
+        console.error(
+          `[Main] Error processing tile ${z}-${x}-${y}: ${error.message}`,
+        );
       }
-    };
+      completedCount++;
+      console.log(
+        `[Main] ${completedCount}/${totalTiles} tiles done${
+          failed.length ? ` (${failed.length} failed)` : ""
+        }`,
+      );
+    }
+  };
 
-    // Start the initial batch of workers
-    scheduleNextTile();
-  });
+  await Promise.all(
+    Array.from(
+      { length: Math.max(1, Math.min(maxProcesses, totalTiles)) },
+      run,
+    ),
+  );
+
+  if (failed.length > 0) {
+    const shown = failed.slice(0, 20).join(", ");
+    throw new Error(
+      `${failed.length} of ${totalTiles} tiles failed: ${shown}${
+        failed.length > 20 ? ", ..." : ""
+      }. Run the same command again to retry them: tiles already written are skipped.`,
+    );
+  }
+  console.log(`[Main] All ${totalTiles} tiles processed.`);
 }
 
 // --- Command Handlers ---
@@ -505,6 +507,13 @@ async function main(): Promise<void> {
       description: "The number of parallel processes to use.",
       parser: Number,
       defaultValue: 8,
+    },
+    {
+      type: "parsed",
+      flags: "--demTimeout <seconds>",
+      description: "Seconds to wait for a DEM tile before giving up on it.",
+      parser: Number,
+      defaultValue: 120,
     },
     // no-data masks
     {

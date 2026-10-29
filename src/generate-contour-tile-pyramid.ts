@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { writeFileSync, mkdir, existsSync } from "fs";
+import { mkdir, existsSync } from "fs";
+import { mkdir as mkdirAsync, writeFile as writeFileAsync } from "fs/promises";
 import mlcontour from "maplibre-contour";
 import {
   extractZXYFromUrlTrim,
@@ -75,6 +76,11 @@ program
     "--outputDir <string>",
     "The output directory where tiles will be stored.",
   )
+  .option(
+    "--demTimeout <seconds>",
+    "Seconds to wait for a DEM tile before giving up on it.",
+    "120",
+  )
   // --- No-data masks ---
   .option(
     "--maskValue <number>",
@@ -111,6 +117,7 @@ const {
   blankTileFormat,
   maskValue,
   maskRange,
+  demTimeout,
   verbose, // Capture the verbose option
 } = options;
 
@@ -384,7 +391,7 @@ const demManagerOptions = {
   cacheSize: 100,
   encoding: encoding as Encoding,
   maxzoom: numsourceMaxZoom,
-  timeoutMs: 10000,
+  timeoutMs: Number(demTimeout) * 1000,
   decodeImage,
   demUrlPattern: demUrlPattern, // Pass the determined pattern
   getTile: currentFetcher, // Pass the appropriate fetcher function
@@ -398,7 +405,19 @@ const manager = demUrlPattern
 // Tile Processing Function (using the manager)
 // --------------------------------------------------
 
-async function processTile(v: Tile): Promise<void> {
+type TileResult = "written" | "exists" | "nodata" | "empty";
+
+// How many tiles are in flight at once. A sliding window rather than fixed
+// batches, so one slow tile does not hold up the rest of its batch.
+const TILE_CONCURRENCY = 25;
+
+// A tile that takes longer than this is reported when it finishes. Tracing is
+// synchronous, so this cannot interrupt one, but it names the tile.
+const SLOW_TILE_SECONDS = 30;
+
+const PROGRESS_INTERVAL_MS = 10000;
+
+async function processTile(v: Tile): Promise<TileResult> {
   if (!manager) {
     throw new Error("LocalDemManager is not initialized. Check DEM URL.");
   }
@@ -413,11 +432,7 @@ async function processTile(v: Tile): Promise<void> {
     if (verbose) {
       console.log(`[Tile ${z}-${x}-${y}] Tile already exists. Skipping.`);
     }
-    return Promise.resolve();
-  }
-
-  if (verbose) {
-    console.log(`[Tile ${z}-${x}-${y}] Generating contour tile...`);
+    return "exists";
   }
 
   let tileOptions = contourOptions;
@@ -425,83 +440,114 @@ async function processTile(v: Tile): Promise<void> {
     tileOptions = getOptionsForZoom(contourOptions, z);
   }
 
-  try {
-    const tile = await manager.fetchContourTile(
-      z,
-      x,
-      y,
-      tileOptions,
-      new AbortController(), // AbortController can be used for timeout/cancellation
-    );
-    const tileBuffer = Buffer.from(tile.arrayBuffer);
-
-    // Nothing to draw where the DEM has no tile: the lines stop where the
-    // ground does, so no file is written. The DEM tile this one is drawn from
-    // is the source tile at or above the source's maximum zoom.
-    const demZ = Math.min(z, numsourceMaxZoom);
-    const demDiv = 2 ** (z - demZ);
-    if (
-      missingDemTiles.has(
-        `${demZ}/${Math.floor(x / demDiv)}/${Math.floor(y / demDiv)}`,
-      )
-    ) {
-      if (verbose) {
-        console.log(
-          `[Tile ${z}-${x}-${y}] No DEM data under this tile. Not writing.`,
-        );
-      }
-      return;
-    }
-
-    // Ensure directory exists before writing
-    await new Promise<void>((resolve, reject) => {
-      mkdir(dirPath, { recursive: true }, (err) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        writeFileSync(filePath, tileBuffer);
-        resolve();
-      });
-    });
-    if (verbose) {
-      console.log(`[Tile ${z}-${x}-${y}] Successfully wrote ${filePath}`);
-    }
-  } catch (error: any) {
-    // Log error, but don't necessarily exit here as it might be a single tile failure
-    console.error(`Error processing tile ${z}/${x}/${y}: ${error.message}`);
-    // Re-throwing might be necessary if we want the main process to catch it and exit
-    throw error;
+  // Above the shallowest threshold there is nothing to draw
+  if (!("levels" in tileOptions) || tileOptions.levels.length === 0) {
+    return "empty";
   }
+
+  if (verbose) {
+    console.log(`[Tile ${z}-${x}-${y}] Generating contour tile...`);
+  }
+
+  const startedAt = Date.now();
+  const tile = await manager.fetchContourTile(
+    z,
+    x,
+    y,
+    tileOptions,
+    new AbortController(),
+  );
+  const seconds = (Date.now() - startedAt) / 1000;
+  if (seconds >= SLOW_TILE_SECONDS) {
+    console.log(
+      `[slow] Tile ${z}/${x}/${y} took ${seconds.toFixed(1)}s (${(
+        tile.arrayBuffer.byteLength /
+        1024 /
+        1024
+      ).toFixed(1)} MB). Check its DEM for no-data pixels.`,
+    );
+  }
+
+  // Nothing to draw where the DEM has no tile: the lines stop where the
+  // ground does, so no file is written. The DEM tile this one is drawn from
+  // is the source tile at or above the source's maximum zoom.
+  const demZ = Math.min(z, numsourceMaxZoom);
+  const demDiv = 2 ** (z - demZ);
+  if (
+    missingDemTiles.has(
+      `${demZ}/${Math.floor(x / demDiv)}/${Math.floor(y / demDiv)}`,
+    )
+  ) {
+    if (verbose) {
+      console.log(
+        `[Tile ${z}-${x}-${y}] No DEM data under this tile. Not writing.`,
+      );
+    }
+    return "nodata";
+  }
+
+  // An empty result is a tile with nothing in it, and is not written
+  if (tile.arrayBuffer.byteLength === 0) {
+    return "empty";
+  }
+
+  await mkdirAsync(dirPath, { recursive: true });
+  await writeFileAsync(filePath, Buffer.from(tile.arrayBuffer));
+  if (verbose) {
+    console.log(`[Tile ${z}-${x}-${y}] Successfully wrote ${filePath}`);
+  }
+  return "written";
 }
 
-async function processQueue(
-  queue: Tile[],
-  batchSize: number = 25, // Process in batches to manage concurrent Promises
-): Promise<void> {
-  for (let i = 0; i < queue.length; i += batchSize) {
-    const batch = queue.slice(i, i + batchSize);
+type Failure = { tile: Tile; message: string };
+
+async function processQueue(queue: Tile[]): Promise<Failure[]> {
+  const counts: Record<TileResult, number> = {
+    written: 0,
+    exists: 0,
+    nodata: 0,
+    empty: 0,
+  };
+  const failures: Failure[] = [];
+  const startedAt = Date.now();
+  let next = 0;
+  let done = 0;
+  let lastReport = Date.now();
+
+  const report = () => {
+    const seconds = Math.round((Date.now() - startedAt) / 1000);
     console.log(
-      `Processing batch ${i / batchSize + 1} of ${Math.ceil(
-        queue.length / batchSize,
-      )} for source tile ${z}/${x}/${y}`,
+      `[progress] ${z}/${x}/${y}: ${done}/${queue.length} tiles (${counts.written} written, ${counts.exists} existing, ${counts.nodata} no data, ${counts.empty} empty, ${failures.length} failed) in ${seconds}s`,
     );
-    try {
-      await Promise.all(batch.map(processTile));
-      console.log(
-        `Completed batch ${i / batchSize + 1} of ${Math.ceil(
-          queue.length / batchSize,
-        )} for source tile ${z}/${x}/${y}`,
-      );
-    } catch (error) {
-      // If any tile in the batch fails, catch the error to prevent stopping the loop
-      // unless we explicitly want to stop on first error.
-      // For now, log and continue processing other batches.
-      console.error(`Error in batch starting at index ${i}:`, error);
-      // If you want to stop on first error, uncomment the next line:
-      // throw error;
+  };
+
+  // Every failure is kept and the rest carry on, so one bad tile cannot hide
+  // behind the others or stop a long run. The caller reports them at the end.
+  const run = async () => {
+    while (next < queue.length) {
+      const tile = queue[next++];
+      try {
+        counts[await processTile(tile)]++;
+      } catch (error: any) {
+        const message = error?.message ?? String(error);
+        failures.push({ tile, message });
+        console.error(
+          `[failed] Tile ${tile[2]}/${tile[0]}/${tile[1]}: ${message}`,
+        );
+      }
+      done++;
+      if (Date.now() - lastReport >= PROGRESS_INTERVAL_MS) {
+        lastReport = Date.now();
+        report();
+      }
     }
-  }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(TILE_CONCURRENCY, queue.length) }, run),
+  );
+  report();
+  return failures;
 }
 
 // --------------------------------------------------
@@ -532,22 +578,42 @@ if (!existsSync(outputDir)) {
   });
 }
 
+// Lets the process end on its own, which flushes the pipes and closes its
+// handles cleanly. Calling process.exit() straight away can crash node on
+// Windows with a libuv assertion while a handle is still closing, and that
+// crash reads as a failed pyramid. If something a DEM source left open keeps
+// the process alive, this forces the exit after a delay so the pyramid waiting
+// on it is not stuck. The timer is unref'd, so it never keeps the process
+// alive itself.
+function finish(code: number): void {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 15000).unref();
+}
+
 if (manager) {
   processQueue(children)
-    .then(() => {
+    .then((failures) => {
+      if (failures.length > 0) {
+        console.error(
+          `[failed] ${failures.length} of ${children.length} tiles for pyramid ${z}/${x}/${y} could not be generated. Run it again to retry them: tiles already written are skipped.`,
+        );
+        finish(1);
+        return;
+      }
       console.log(
         `All contour tiles for pyramid originating from ${z}/${x}/${y} have been written!`,
       );
+      finish(0);
     })
     .catch((error) => {
       console.error(
         `An error occurred during the tile generation process: ${error.message}`,
       );
-      process.exit(1);
+      finish(1);
     });
 } else {
   console.error(
     "Failed to initialize DEM manager. Check DEM URL and ensure it's a supported format (PMTiles, MBTiles, or a tile URL pattern).",
   );
-  process.exit(1);
+  finish(1);
 }
